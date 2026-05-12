@@ -77,8 +77,8 @@ fn split_host_port(host: &str) -> (String, Option<String>) {
 
 fn should_omit_port_for_scheme(scheme: &str, port: &str) -> bool {
     match scheme {
-        "https" => port == "443" || port == "80",
-        "http" => port == "80" || port == "443",
+        "https" => port == "443",
+        "http" => port == "80",
         _ => false,
     }
 }
@@ -197,10 +197,34 @@ mod tests {
         let state = test_state();
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com:80"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com:443"));
 
         let base_url = request_base_url(&headers, state.config.port);
         assert_eq!(base_url, "https://example.com");
+    }
+
+    #[test]
+    fn request_base_url_keeps_non_default_https_port() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        headers.insert("x-forwarded-port", HeaderValue::from_static("80"));
+
+        let base_url = request_base_url(&headers, state.config.port);
+        assert_eq!(base_url, "https://example.com:80");
+    }
+
+    #[test]
+    fn request_base_url_keeps_non_default_http_port() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        headers.insert("x-forwarded-port", HeaderValue::from_static("443"));
+
+        let base_url = request_base_url(&headers, state.config.port);
+        assert_eq!(base_url, "http://example.com:443");
     }
 
     #[test]
