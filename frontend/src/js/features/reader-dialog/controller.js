@@ -1,6 +1,19 @@
 import { $ } from "../../dom.js";
 import { buildFrontendPageUrl, isTrustedWindowMessage } from "../../config.js";
 import {
+  downloadBlob,
+  fileNameFromDisposition,
+  formatTransferSize,
+  prepareDownloadTarget,
+  saveResponseDownload,
+} from "../../downloads.js";
+import {
+  completeDownloadToast,
+  failDownloadToast,
+  showDownloadPreparing,
+  updateDownloadProgress,
+} from "../../download-feedback.js";
+import {
   findReadyManifestArtifact,
   resolveManifestArtifactUrl,
 } from "../../job-artifacts.js";
@@ -14,22 +27,6 @@ async function loadPdfDocument() {
       .then((module) => module.PDFDocument);
   }
   return pdfDocumentModulePromise;
-}
-
-function fileNameFromDisposition(disposition, fallback) {
-  if (!disposition || typeof disposition !== "string") {
-    return fallback;
-  }
-  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8Match && utf8Match[1]) {
-    try {
-      return decodeURIComponent(utf8Match[1]);
-    } catch (_err) {
-      return utf8Match[1];
-    }
-  }
-  const plainMatch = disposition.match(/filename=\"?([^\";]+)\"?/i);
-  return plainMatch && plainMatch[1] ? plainMatch[1] : fallback;
 }
 
 function jobIdFromReaderUrl(url) {
@@ -103,17 +100,6 @@ function resolveOriginalPdfName(state) {
   return sanitizeFilenamePart(stripExtension(originalName));
 }
 
-function downloadBlob(blob, filename) {
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
-}
-
 function easeOutCubic(value) {
   return 1 - ((1 - value) ** 3);
 }
@@ -168,16 +154,51 @@ function currentReaderArtifactUrls(state) {
   return { sourcePdf, translatedPdf };
 }
 
-async function downloadProtectedResource(fetchProtected, url, fallbackName, preferredName = "") {
+async function downloadProtectedResource(
+  fetchProtected,
+  url,
+  fallbackName,
+  preferredName = "",
+  onStatus = null,
+  onBusy = null,
+) {
+  const downloadTarget = await prepareDownloadTarget(preferredName || fallbackName);
+  if (downloadTarget.kind === "aborted") {
+    return;
+  }
+  if (typeof onBusy === "function") {
+    onBusy(true, "下载中…");
+  }
+  showDownloadPreparing(preferredName || fallbackName);
   const resp = await fetchProtected(url);
   if (!resp.ok) {
     const text = await resp.text();
     throw new Error(`下载失败: ${resp.status} ${text || "unknown error"}`);
   }
-  const blob = await resp.blob();
   const disposition = resp.headers.get("content-disposition") || "";
   const finalName = `${preferredName || ""}`.trim() || fileNameFromDisposition(disposition, fallbackName);
-  downloadBlob(blob, finalName);
+  await saveResponseDownload(resp, {
+    target: downloadTarget,
+    filename: finalName,
+    onProgress: ({ receivedBytes, totalBytes, percent, done }) => {
+      if (typeof onStatus === "function") {
+        onStatus({
+          filename: finalName,
+          receivedBytes,
+          totalBytes,
+          percent,
+          done,
+        });
+      }
+      if (typeof onBusy === "function") {
+        onBusy(true, done
+          ? "已完成"
+          : Number.isFinite(percent)
+            ? `${Math.max(0, Math.min(100, Number(percent) || 0)).toFixed(0)}%`
+            : "下载中…");
+      }
+    },
+  });
 }
 
 async function fetchProtectedBytes(fetchProtected, url, label) {
@@ -246,6 +267,31 @@ export function mountReaderDialogFeature({
 
   function readerDialogComponent() {
     return document.querySelector("reader-dialog");
+  }
+
+  function summarizeDownloadProgress(receivedBytes, totalBytes, percent) {
+    const receivedText = formatTransferSize(receivedBytes);
+    if (Number.isFinite(totalBytes) && totalBytes > 0) {
+      const totalText = formatTransferSize(totalBytes);
+      const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+      return `正在下载 ${receivedText} / ${totalText} (${safePercent.toFixed(0)}%)`;
+    }
+    return receivedText ? `正在下载 ${receivedText}` : "正在下载…";
+  }
+
+  function setToolbarDownloadBusy(button, busy, text = "") {
+    if (!button) {
+      return;
+    }
+    const label = button.querySelector("span");
+    if (!label) {
+      return;
+    }
+    if (!button.dataset.defaultLabel) {
+      button.dataset.defaultLabel = label.textContent?.trim() || "下载";
+    }
+    button.disabled = busy;
+    label.textContent = busy ? text || "下载中…" : button.dataset.defaultLabel;
   }
 
   function buildReaderPageUrl(jobId) {
@@ -332,9 +378,33 @@ export function mountReaderDialogFeature({
       return;
     }
     try {
-      await downloadProtectedResource(fetchProtected, url, `${state.currentJobId || "result"}-source.pdf`);
+      await downloadProtectedResource(
+        fetchProtected,
+        url,
+        `${state.currentJobId || "result"}-source.pdf`,
+        "",
+        ({ filename, receivedBytes, totalBytes, percent, done }) => {
+          if (done) {
+            setText("error-box", `已开始保存 ${filename}`);
+            completeDownloadToast(filename);
+            return;
+          }
+          setText("error-box", summarizeDownloadProgress(receivedBytes, totalBytes, percent));
+          updateDownloadProgress({
+            filename,
+            receivedBytes,
+            totalBytes,
+            percent,
+          });
+        },
+        (busy, text) => setToolbarDownloadBusy(button, busy, text),
+      );
     } catch (err) {
       setText("error-box", err.message);
+      failDownloadToast(err.message || "下载失败");
+    } finally {
+      setToolbarDownloadBusy(button, false);
+      syncToolbarActions();
     }
   }
 
@@ -352,9 +422,28 @@ export function mountReaderDialogFeature({
         url,
         `${state.currentJobId || "result"}-translated.pdf`,
         preferredName,
+        ({ filename, receivedBytes, totalBytes, percent, done }) => {
+          if (done) {
+            setText("error-box", `已开始保存 ${filename}`);
+            completeDownloadToast(filename);
+            return;
+          }
+          setText("error-box", summarizeDownloadProgress(receivedBytes, totalBytes, percent));
+          updateDownloadProgress({
+            filename,
+            receivedBytes,
+            totalBytes,
+            percent,
+          });
+        },
+        (busy, text) => setToolbarDownloadBusy(button, busy, text),
       );
     } catch (err) {
       setText("error-box", err.message);
+      failDownloadToast(err.message || "下载失败");
+    } finally {
+      setToolbarDownloadBusy(button, false);
+      syncToolbarActions();
     }
   }
 

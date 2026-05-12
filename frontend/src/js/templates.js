@@ -13,5 +13,5 @@ export async function renderPageShell() {
     loadPartial("../partials/dialogs.html"),
   ]);
 
-  document.body.innerHTML = `${mainContent}${dialogs}`;
+  document.body.innerHTML = `${mainContent}${dialogs}<download-toast></download-toast>`;
 }

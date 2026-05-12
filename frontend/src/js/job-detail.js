@@ -2,6 +2,18 @@ import { buildFrontendPageUrl, isMockMode } from "./config.js";
 import { API_PREFIX } from "./constants.js";
 import { $ } from "./dom.js";
 import {
+  fileNameFromDisposition,
+  formatTransferSize,
+  prepareDownloadTarget,
+  saveResponseDownload,
+} from "./downloads.js";
+import {
+  completeDownloadToast,
+  failDownloadToast,
+  showDownloadPreparing,
+  updateDownloadProgress,
+} from "./download-feedback.js";
+import {
   fetchJobArtifactsManifest,
   fetchJobEvents,
   fetchJobMarkdown,
@@ -60,6 +72,28 @@ function setActionLink(id, url, enabled) {
   el.href = enabled && url ? url : "#";
   el.classList.toggle("disabled", !enabled);
   el.setAttribute("aria-disabled", enabled ? "false" : "true");
+}
+
+function setDownloadLinkBusy(link, busy, text = "") {
+  if (!link) {
+    return;
+  }
+  if (!link.dataset.defaultLabel) {
+    link.dataset.defaultLabel = link.textContent?.trim() || "下载";
+  }
+  link.classList.toggle("disabled", busy);
+  link.setAttribute("aria-disabled", busy ? "true" : "false");
+  link.textContent = busy ? text || "下载中…" : link.dataset.defaultLabel;
+}
+
+function summarizeDownloadProgress(receivedBytes, totalBytes, percent) {
+  const receivedText = formatTransferSize(receivedBytes);
+  if (Number.isFinite(totalBytes) && totalBytes > 0) {
+    const totalText = formatTransferSize(totalBytes);
+    const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    return `正在下载 ${receivedText} / ${totalText} (${safePercent.toFixed(0)}%)`;
+  }
+  return receivedText ? `正在下载 ${receivedText}` : "正在下载…";
 }
 
 function firstJobIdFromPayload(payload) {
@@ -307,33 +341,6 @@ function formatEventPayload(payload) {
   } catch (_err) {
     return "";
   }
-}
-
-function fileNameFromDisposition(disposition, fallback) {
-  if (!disposition || typeof disposition !== "string") {
-    return fallback;
-  }
-  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
-  if (utf8Match && utf8Match[1]) {
-    try {
-      return decodeURIComponent(utf8Match[1]);
-    } catch (_err) {
-      return utf8Match[1];
-    }
-  }
-  const plainMatch = disposition.match(/filename=\"?([^\";]+)\"?/i);
-  return plainMatch && plainMatch[1] ? plainMatch[1] : fallback;
-}
-
-function downloadBlob(blob, filename) {
-  const objectUrl = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = objectUrl;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 
 function formatSizeBytes(value) {
@@ -752,18 +759,46 @@ function bindProtectedDownloadLink(id, fallbackNameFactory) {
       return;
     }
     event.preventDefault();
+    const fallbackName = fallbackNameFactory(detailPageState.job?.job_id || "job");
+    const downloadTarget = await prepareDownloadTarget(fallbackName);
+    if (downloadTarget.kind === "aborted") {
+      return;
+    }
     try {
+      setDownloadLinkBusy(link, true, "下载中…");
+      showDownloadPreparing(fallbackName);
       const resp = await fetchProtected(url);
       if (!resp.ok) {
         const text = await resp.text();
         throw new Error(`下载失败: ${resp.status} ${text || "unknown error"}`);
       }
-      const blob = await resp.blob();
       const disposition = resp.headers.get("content-disposition") || "";
-      const fallbackName = fallbackNameFactory(detailPageState.job?.job_id || "job");
-      downloadBlob(blob, fileNameFromDisposition(disposition, fallbackName));
+      const filename = fileNameFromDisposition(disposition, fallbackName);
+      await saveResponseDownload(resp, {
+        target: downloadTarget,
+        filename,
+        onProgress: ({ receivedBytes, totalBytes, percent, done }) => {
+          if (done) {
+            setText("detail-head-note", `已开始保存 ${filename}`);
+            setDownloadLinkBusy(link, true, "已完成");
+            completeDownloadToast(filename);
+            return;
+          }
+          setText("detail-head-note", summarizeDownloadProgress(receivedBytes, totalBytes, percent));
+          setDownloadLinkBusy(link, true, Number.isFinite(percent) ? `${Math.max(0, Math.min(100, Number(percent) || 0)).toFixed(0)}%` : "下载中…");
+          updateDownloadProgress({
+            filename,
+            receivedBytes,
+            totalBytes,
+            percent,
+          });
+        },
+      });
     } catch (error) {
       setText("detail-head-note", error.message || "下载失败");
+      failDownloadToast(error.message || "下载失败");
+    } finally {
+      setDownloadLinkBusy(link, false);
     }
   });
 }
