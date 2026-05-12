@@ -6,6 +6,7 @@ set -eu
 : "${FRONT_OCR_PROVIDER:=paddle}"
 : "${FRONT_PADDLE_TOKEN:=}"
 : "${FRONT_MINERU_TOKEN:=}"
+: "${FRONT_PADDLE_API_URL:=}"
 : "${FRONT_MODEL_API_KEY:=}"
 : "${FRONT_MODEL:=deepseek-v4-flash}"
 : "${FRONT_BASE_URL:=https://api.deepseek.com/v1}"
@@ -28,6 +29,7 @@ window.__FRONT_RUNTIME_CONFIG__ = {
   ocrProvider: "${FRONT_OCR_PROVIDER}",
   paddleToken: "${FRONT_PADDLE_TOKEN}",
   mineruToken: "${FRONT_MINERU_TOKEN}",
+  paddleApiUrl: "${FRONT_PADDLE_API_URL}",
   modelApiKey: "${FRONT_MODEL_API_KEY}",
   model: "${FRONT_MODEL}",
   baseUrl: "${FRONT_BASE_URL}",

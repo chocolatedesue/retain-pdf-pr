@@ -9,16 +9,19 @@ pub(crate) fn request_base_url(headers: &HeaderMap, default_port: u16) -> String
     let scheme = forwarded_header(headers, "x-forwarded-proto")
         .or_else(|| forwarded_header(headers, "x-scheme"))
         .unwrap_or_else(|| "http".to_string());
-    let mut host = forwarded_header(headers, "x-forwarded-host")
+    let host = forwarded_header(headers, "x-forwarded-host")
         .or_else(|| forwarded_header(headers, header::HOST.as_str()))
         .unwrap_or_else(|| format!("127.0.0.1:{default_port}"));
-    let forwarded_port = forwarded_header(headers, "x-forwarded-port");
-    if !host.contains(':') {
-        if let Some(port) = forwarded_port.filter(|value| !value.is_empty()) {
-            host = format!("{host}:{port}");
-        }
-    }
-    format!("{scheme}://{host}")
+    let forwarded_port = forwarded_header(headers, "x-forwarded-port")
+        .filter(|value| !value.is_empty());
+    let (hostname, host_port) = split_host_port(&host);
+    let candidate_port = forwarded_port.or(host_port);
+    let normalized_host = match candidate_port {
+        Some(port) if should_omit_port_for_scheme(&scheme, &port) => hostname,
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname,
+    };
+    format!("{scheme}://{normalized_host}")
 }
 
 pub(crate) fn build_submission_view(
@@ -54,6 +57,30 @@ fn forwarded_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(',').next().unwrap_or(v).trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn split_host_port(host: &str) -> (String, Option<String>) {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+    if trimmed.starts_with('[') {
+        return (trimmed.to_string(), None);
+    }
+    if let Some((name, port)) = trimmed.rsplit_once(':') {
+        if !name.is_empty() && !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) {
+            return (name.to_string(), Some(port.to_string()));
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
+fn should_omit_port_for_scheme(scheme: &str, port: &str) -> bool {
+    match scheme {
+        "https" => port == "443" || port == "80",
+        "http" => port == "80" || port == "443",
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +166,41 @@ mod tests {
 
         let base_url = request_base_url(&headers, state.config.port);
         assert_eq!(base_url, "https://example.com:8443");
+    }
+
+    #[test]
+    fn request_base_url_omits_default_https_port() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        headers.insert("x-forwarded-port", HeaderValue::from_static("443"));
+
+        let base_url = request_base_url(&headers, state.config.port);
+        assert_eq!(base_url, "https://example.com");
+    }
+
+    #[test]
+    fn request_base_url_omits_default_http_port() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com"));
+        headers.insert("x-forwarded-port", HeaderValue::from_static("80"));
+
+        let base_url = request_base_url(&headers, state.config.port);
+        assert_eq!(base_url, "http://example.com");
+    }
+
+    #[test]
+    fn request_base_url_omits_default_port_embedded_in_forwarded_host() {
+        let state = test_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-forwarded-host", HeaderValue::from_static("example.com:80"));
+
+        let base_url = request_base_url(&headers, state.config.port);
+        assert_eq!(base_url, "https://example.com");
     }
 
     #[test]
